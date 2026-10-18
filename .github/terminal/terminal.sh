@@ -9,6 +9,7 @@ REPO="${GITHUB_REPOSITORY:?}"
 WORK="${RUNNER_TEMP:-/tmp}/state-work"
 IMAGE="${DEV_IMAGE:-mcr.microsoft.com/devcontainers/universal:linux}"
 CNAME=dev
+TTYD_PORT=7690                                  # not 7681: avoids clashing with the distro ttyd service
 CUSER=codespace
 KEEP=2                                         # complete snapshots to keep
 CHUNK=1900M                                    # release assets are limited to 2 GiB
@@ -19,6 +20,23 @@ need() { command -v "$1" >/dev/null || { apt-get update -qq && apt-get install -
 enc() { openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:STATE_PASSPHRASE "$@"; }
 dec() { enc -d "$@"; }
 log() { echo "[terminal] $*"; }
+notify() {  # optional Telegram message (keeps the URL out of public logs)
+  [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ] || return 0
+  curl -fsS -m 15 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" >/dev/null || true
+}
+install_ttyd() {
+  # Static binary on purpose: the Ubuntu `ttyd` package also installs+starts a systemd service
+  # (read-only, no -W) that grabs port 7681 and swallows all keyboard input.
+  if ! command -v ttyd >/dev/null; then
+    curl -fsSL -o /usr/local/bin/ttyd https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64 \
+      && chmod +x /usr/local/bin/ttyd \
+      || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ttyd
+  fi
+  systemctl disable --now ttyd >/dev/null 2>&1 || true
+  systemctl mask ttyd >/dev/null 2>&1 || true
+  ttyd --version
+}
 
 assets() { gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name' 2>/dev/null || true; }
 
@@ -101,9 +119,9 @@ boot() {
     -e GIT_CONFIG_GLOBAL=/persist/.gitconfig \
     "$IMAGE" sleep infinity
   local sh='bash -lc'
-  docker exec -u root $CNAME $sh 'command -v tmux >/dev/null || (apt-get update -qq && apt-get install -y -qq tmux)'
+  docker exec -u root -e DEBIAN_FRONTEND=noninteractive $CNAME $sh 'command -v tmux >/dev/null || (apt-get update -qq && apt-get install -y -qq tmux)'
   # NOTE: the npm package is `opencode-ai` (there is no @opencode/cli). V2 beta = @opencode-ai/cli@next (separate session tables) - not used here.
-  docker exec -u $CUSER -e OV="${OPENCODE_VERSION:-latest}" $CNAME $sh 'npm install -g "opencode-ai@$OV" || sudo env "PATH=$PATH" npm install -g "opencode-ai@$OV"; opencode --version'
+  docker exec -u $CUSER -e OV="${OPENCODE_VERSION:-latest}" $CNAME $sh 'npm install -g --allow-scripts=opencode-ai "opencode-ai@$OV" || sudo env "PATH=$PATH" npm install -g --allow-scripts=opencode-ai "opencode-ai@$OV"; opencode --version'
   # git identity / credentials (persisted file lives in /persist)
   [ -n "${GIT_NAME:-}" ]  && docker exec -u $CUSER $CNAME git config --global user.name  "$GIT_NAME"
   [ -n "${GIT_EMAIL:-}" ] && docker exec -u $CUSER $CNAME git config --global user.email "$GIT_EMAIL"
@@ -119,10 +137,22 @@ boot() {
   docker exec -u $CUSER $CNAME $sh '[ -f /persist/bootstrap.sh ] && bash /persist/bootstrap.sh || true'
 
   # web terminal: ttyd -> tmux inside the container (tmux survives browser reconnects)
-  command -v ttyd >/dev/null || apt-get install -y -qq ttyd
-  nohup ttyd -W -i 127.0.0.1 -p 7681 -c "${TTYD_USER:-dev}:${TTYD_PASS:?}" -t fontSize=16 \
-    docker exec -it -u $CUSER -w /workspaces $CNAME bash -lc 'exec tmux new -A -s main' \
+  install_ttyd
+  local auth=()
+  [ -n "${TTYD_PASS:-}" ] && auth=(-c "${TTYD_USER:-dev}:$TTYD_PASS")
+  nohup ttyd -W -i lo -p "$TTYD_PORT" "${auth[@]}" -t fontSize=16 \
+    docker exec -it -u $CUSER -w /workspaces $CNAME bash -lc \
+    'tmux new -A -s main \; set -g mouse on \; set -g history-limit 50000 || exec bash -l' \
     >"$WORK/ttyd.log" 2>&1 &
+  local code=000
+  for _ in $(seq 20); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$TTYD_PORT/" || true)
+    case "$code" in 200|401) break;; esac; sleep 1
+  done
+  case "$code" in
+    200|401) log "ttyd is up (HTTP $code, auth: $([ ${#auth[@]} -gt 0 ] && echo on || echo OFF))";;
+    *) log "ERROR: ttyd is not healthy (HTTP $code)"; cat "$WORK/ttyd.log"; ss -ltnp | grep ":$TTYD_PORT" || true; exit 1;;
+  esac
   # tunnel
   if ! command -v cloudflared >/dev/null; then
     curl -fsSL -o "$WORK/cf.deb" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -132,14 +162,19 @@ boot() {
     nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" >"$WORK/cf.log" 2>&1 &
     log "named tunnel started (use your fixed hostname)"
   else
-    nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7681 >"$WORK/cf.log" 2>&1 &
+    nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$TTYD_PORT" >"$WORK/cf.log" 2>&1 &
     local url=""
     for _ in $(seq 40); do
       url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$WORK/cf.log" | head -1 || true)
       [ -n "$url" ] && break; sleep 2
     done
-    log "terminal URL: ${url:-<not ready, see cf.log>}"
-    echo "### Terminal: ${url:-pending}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+      notify "Terminal ready: ${url:-<URL not ready, see Actions log>}"
+      log "terminal URL sent to Telegram (not printed here)"
+    else
+      log "terminal URL: ${url:-<not ready, see cf.log>}"
+      echo "### Terminal: ${url:-pending}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+    fi
   fi
 }
 
@@ -152,7 +187,7 @@ final() {
 
 hold() {
   local deadline=$(( ${JOB_START:?} + SESSION_SECONDS )) last; last=$(date +%s)
-  log "session open until $(date -d "@$deadline" +%T)"
+  log "session open for $(( (deadline - $(date +%s)) / 60 )) more minutes (until $(date -u -d "@$deadline" +%H:%M) UTC)"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 5
     if [ -f "$STATE_DIR/workspaces/.save-now" ]; then       # in the terminal: `touch /workspaces/.save-now`
@@ -162,6 +197,7 @@ hold() {
     fi
   done
   final
+  notify "Session reached its time limit: state saved, a new run is starting."
   echo "saved=true"  >> "$GITHUB_OUTPUT"
   echo "chain=true"  >> "$GITHUB_OUTPUT"
 }
